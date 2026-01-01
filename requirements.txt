@@ -1,0 +1,10 @@
+streamlit
+pandas
+gpxpy
+folium
+streamlit-folium
+plotly
+requests
+supabase
+scipy
+numpy
