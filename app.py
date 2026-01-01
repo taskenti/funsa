@@ -13,30 +13,32 @@ from datetime import datetime, timedelta
 import io
 import numpy as np
 
-# --- CONFIGURACIÓN ---
-st.set_page_config(page_title="MicoRutas Pro: Analyst", layout="wide", page_icon="🍄")
+# --- CONFIGURACIÓN DE PÁGINA ---
+st.set_page_config(page_title="MicoData: Dashboard", layout="wide", page_icon="🍄")
 
-# --- GESTOR DE BD (SQLite Local para simplificar el ejemplo, compatible con Supabase) ---
+# --- CSS PARA MAXIMIZAR ESPACIO ---
+st.markdown("""
+    <style>
+        .block-container {padding-top: 1rem; padding-bottom: 0rem;}
+        h1 {margin-bottom: 0rem;}
+    </style>
+""", unsafe_allow_html=True)
+
+# --- GESTOR DE BD OPTIMIZADO PARA BIG DATA ---
 class DBManager:
     def __init__(self):
-        self.conn = sqlite3.connect('micorutas_v2.db', check_same_thread=False)
+        self.conn = sqlite3.connect('micodata_global.db', check_same_thread=False)
         self.create_tables()
 
     def create_tables(self):
         c = self.conn.cursor()
-        # Añadimos columnas para análisis avanzado
+        # Tabla optimizada: Guardamos 'points_json' pero también metadatos clave para filtrado rápido
         c.execute('''
             CREATE TABLE IF NOT EXISTS rutas (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 filename TEXT,
                 date TEXT,
-                distance_km REAL,
-                elevation_gain REAL,
-                duration_h REAL,
-                avg_speed_kmh REAL,
-                forest_type TEXT,
-                pct_umbria REAL,
-                pct_solana REAL,
+                min_lat REAL, max_lat REAL, min_lon REAL, max_lon REAL,
                 points_json TEXT
             )
         ''')
@@ -44,322 +46,249 @@ class DBManager:
 
     def save_route(self, data):
         c = self.conn.cursor()
-        points_str = json.dumps(data['points'])
+        # Calcular Bounding Box de la ruta para búsquedas rápidas futuras
+        lats = [p['lat'] for p in data['points']]
+        lons = [p['lon'] for p in data['points']]
+        
         c.execute('''
-            INSERT INTO rutas (filename, date, distance_km, elevation_gain, duration_h, avg_speed_kmh, forest_type, pct_umbria, pct_solana, points_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (data['filename'], data['date'], data['distance_km'], data['elevation_gain'], 
-              data['duration_h'], data['avg_speed_kmh'], data['forest_type'],
-              data['pct_umbria'], data['pct_solana'], points_str))
+            INSERT INTO rutas (filename, date, min_lat, max_lat, min_lon, max_lon, points_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (data['filename'], data['date'], min(lats), max(lats), min(lons), max(lons), json.dumps(data['points'])))
         self.conn.commit()
 
-    def get_routes(self):
-        df = pd.read_sql_query("SELECT * FROM rutas", self.conn)
-        if not df.empty:
-            df['date'] = pd.to_datetime(df['date'])
-            df['points'] = df['points_json'].apply(json.loads)
-        return df
-    
-    def delete_route(self, id):
-        c = self.conn.cursor()
-        c.execute("DELETE FROM rutas WHERE id=?", (id,))
-        self.conn.commit()
+    # Función clave: Cargar TODOS los puntos en memoria (con caché)
+    @st.cache_data(ttl=600) 
+    def get_all_points_dataframe(_self):
+        # El guion bajo en _self es para que streamlit ignore el objeto DB en el hash de caché
+        df_routes = pd.read_sql_query("SELECT * FROM rutas", _self.conn)
+        
+        all_points = []
+        for _, row in df_routes.iterrows():
+            points = json.loads(row['points_json'])
+            # Añadimos metadatos de la ruta a cada punto (para filtrar por fecha/año después)
+            route_date = pd.to_datetime(row['date'])
+            for p in points:
+                # Downsampling: Si tienes miles de rutas, coge 1 de cada 5 puntos para ir rápido
+                # Si quieres precisión total, quita el 'if'
+                p['route_date'] = route_date
+                p['year'] = route_date.year
+                p['month'] = route_date.month
+                all_points.append(p)
+        
+        return pd.DataFrame(all_points)
 
 db = DBManager()
 
-# --- ALGORITMOS DE ANÁLISIS GPX AVANZADO ---
-def calculate_bearing(lat1, lon1, lat2, lon2):
-    # Calcula la dirección (azimut) entre dos puntos para saber la orientación de la ladera
-    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
-    dlon = lon2 - lon1
-    x = np.sin(dlon) * np.cos(lat2)
-    y = np.cos(lat1) * np.sin(lat2) - (np.sin(lat1) * np.cos(lat2) * np.cos(dlon))
-    initial_bearing = np.arctan2(x, y)
-    initial_bearing = np.degrees(initial_bearing)
-    compass_bearing = (initial_bearing + 360) % 360
-    return compass_bearing
-
-def get_aspect_category(bearing):
-    # Simplificación: Norte/Este -> Umbría (Húmedo), Sur/Oeste -> Solana (Seco)
-    # N(315-45), E(45-135), S(135-225), W(225-315)
-    if 0 <= bearing < 45 or 315 <= bearing <= 360: return "Norte (Umbría)"
-    elif 45 <= bearing < 135: return "Este (Umbría)"
-    elif 135 <= bearing < 225: return "Sur (Solana)"
-    else: return "Oeste (Solana)"
-
-def parse_gpx_advanced(file_buffer, filename, forest_type_input):
+# --- PARSER GPX ---
+def parse_gpx(file_buffer, filename):
     try:
         gpx = gpxpy.parse(file_buffer)
-        points_data = []
-        
-        # Iterar sobre puntos para cálculos vectoriales
-        prev_point = None
-        umbria_count = 0
-        solana_count = 0
-        total_segments = 0
-        
+        points = []
         for track in gpx.tracks:
             for segment in track.segments:
-                for point in segment.points:
-                    
-                    # Datos básicos del punto
-                    p_data = {
-                        'lat': point.latitude,
-                        'lon': point.longitude,
-                        'ele': point.elevation,
-                        'time': point.time,
-                        'speed': 0, # Se calculará
-                        'aspect': None
-                    }
+                # Simplificación ligera para no explotar la BD
+                for i, point in enumerate(segment.points):
+                    if i % 3 == 0: # Guardar 1 de cada 3 puntos
+                        points.append({'lat': point.latitude, 'lon': point.longitude, 'ele': point.elevation, 'speed': 0}) # Speed se calcula luego si hace falta
+        if points:
+            date_obj = gpx.time if gpx.time else datetime.now()
+            return {'filename': filename, 'date': date_obj.strftime('%Y-%m-%d'), 'points': points}
+    except: return None
 
-                    if prev_point:
-                        # Distancia 3D
-                        dist = point.distance_3d(prev_point)
-                        
-                        # Velocidad instantánea (m/s -> km/h)
-                        time_diff = (point.time - prev_point.time).total_seconds() if point.time and prev_point.time else 0
-                        if time_diff > 0:
-                            speed_kmh = (dist / 1000) / (time_diff / 3600)
-                            p_data['speed'] = speed_kmh
-                        
-                        # Orientación (Aspecto) - Solo si nos movemos lo suficiente (>10m)
-                        if dist > 10:
-                            bearing = calculate_bearing(prev_point.latitude, prev_point.longitude, point.latitude, point.longitude)
-                            category = get_aspect_category(bearing)
-                            p_data['aspect'] = category
-                            
-                            if "Umbría" in category: umbria_count += 1
-                            else: solana_count += 1
-                            total_segments += 1
-                    
-                    # Serializar fecha para JSON
-                    if p_data['time']: p_data['time'] = p_data['time'].isoformat()
-                    points_data.append(p_data)
-                    prev_point = point
-
-        # Estadísticas Globales
-        moving_data = gpx.get_moving_data()
-        uphill_downhill = gpx.get_uphill_downhill()
-        
-        pct_umbria = (umbria_count / total_segments * 100) if total_segments > 0 else 0
-        pct_solana = (solana_count / total_segments * 100) if total_segments > 0 else 0
-
-        # Fecha inteligente
-        date_obj = gpx.time if gpx.time else datetime.now()
-        
-        return {
-            'filename': filename,
-            'date': date_obj.strftime('%Y-%m-%d'),
-            'distance_km': round(moving_data.moving_distance / 1000, 2),
-            'elevation_gain': round(uphill_downhill.uphill, 2),
-            'duration_h': round(moving_data.moving_time / 3600, 2),
-            'avg_speed_kmh': round(moving_data.max_speed * 3.6, 2) if moving_data.max_speed else 0, # Usamos max speed como ref o average
-            'forest_type': forest_type_input,
-            'pct_umbria': round(pct_umbria, 1),
-            'pct_solana': round(pct_solana, 1),
-            'points': points_data # Ahora incluye velocidad y aspecto punto a punto
-        }
-    except Exception as e:
-        st.error(f"Error analizando {filename}: {e}")
-        return None
-
-# --- MÓDULO METEO AVANZADO (SMI) ---
+# --- METEO ---
 @st.cache_data(ttl=3600)
-def get_advanced_weather(lat, lon):
-    # Pedimos 60 días atrás para construir el modelo de humedad del suelo
-    end_date = datetime.now().date()
-    start_date = end_date - timedelta(days=60)
+def get_climate_data(lat, lon):
+    end = datetime.now().date()
+    start = end - timedelta(days=45) # 45 días de histórico
     
     url = "https://archive-api.open-meteo.com/v1/archive"
     params = {
-        "latitude": lat,
-        "longitude": lon,
-        "start_date": start_date.strftime("%Y-%m-%d"),
-        "end_date": end_date.strftime("%Y-%m-%d"),
-        "daily": ["precipitation_sum", "temperature_2m_max", "soil_temperature_0_to_7cm_mean"],
-        "timezone": "Europe/Madrid"
+        "latitude": lat, "longitude": lon,
+        "start_date": start, "end_date": end,
+        "daily": ["precipitation_sum", "soil_temperature_0_to_7cm_mean"],
+        "timezone": "auto"
     }
-    
     try:
-        r = requests.get(url, params=params)
-        data = r.json()
-        
-        if 'daily' not in data: return None
-        
-        df_meteo = pd.DataFrame(data['daily'])
-        df_meteo['time'] = pd.to_datetime(df_meteo['time'])
-        
-        # --- ALGORITMO SMI (Soil Moisture Index Simplificado) ---
-        # Simula la acumulación de agua. Cada día el suelo pierde X% (evaporación/drenaje)
-        # y gana lo que llueva.
-        # Factor de retención: 0.85 (Suelo boscoso retiene bien, pero drena)
-        # Factor alto (0.95) = Arcilla (se encharca)
-        # Factor bajo (0.6) = Arena (se seca rápido)
-        
-        retention_factor = 0.90 
-        smi_values = []
-        current_moisture = 0 # Empezamos asumiendo 0 o un valor base
-        
-        for rain in df_meteo['precipitation_sum']:
-            # Fórmula: HumedadHoy = (HumedadAyer * Retención) + LluviaHoy
-            current_moisture = (current_moisture * retention_factor) + rain
-            smi_values.append(current_moisture)
-            
-        df_meteo['SMI'] = smi_values
-        return df_meteo
-        
-    except Exception:
-        return None
+        r = requests.get(url, params=params).json()
+        return pd.DataFrame(r['daily'])
+    except: return None
 
-# --- INTERFAZ ---
-st.title("🍄 MicoRutas Pro: Analizador de Biotopos")
+# --- UI PRINCIPAL ---
 
+# 1. BARRA LATERAL (Solo para cargar datos)
 with st.sidebar:
-    st.header("Importar Datos")
-    forest_type = st.selectbox("Tipo de Bosque (para el archivo actual)", 
-                               ["Pinar", "Robledal", "Hayedo", "Encinar", "Pradera/Mxto", "Desconocido"])
-    uploaded_files = st.file_uploader("Subir GPX", accept_multiple_files=True)
-    
-    if uploaded_files and st.button("Procesar GPX"):
+    st.title("📂 Cargar GPX")
+    uploaded_files = st.file_uploader("Arrastra tus archivos aquí", accept_multiple_files=True)
+    if uploaded_files and st.button("Procesar"):
         bar = st.progress(0)
         for i, f in enumerate(uploaded_files):
             s_io = io.StringIO(f.getvalue().decode("utf-8"))
-            # Pasamos el tipo de bosque
-            data = parse_gpx_advanced(s_io, f.name, forest_type)
+            data = parse_gpx(s_io, f.name)
             if data: db.save_route(data)
             bar.progress((i+1)/len(uploaded_files))
-        st.success("Procesado con análisis topográfico.")
+        st.success("Procesado.")
+        st.cache_data.clear() # Limpiar caché para recargar datos nuevos
         st.rerun()
 
-df = db.get_routes()
+# 2. CARGA DE DATOS MASIVA
+df_all = db.get_all_points_dataframe()
 
-if not df.empty:
-    tab1, tab2, tab3 = st.tabs(["🗺️ Mapa de Búsqueda", "💧 Hidrología y Suelo", "🌲 Topografía y Bosque"])
+if df_all.empty:
+    st.warning("No hay rutas. Sube tus GPX en el menú lateral.")
+    st.stop()
 
-    # --- TAB 1: MAPA TÁCTICO ---
-    with tab1:
-        st.markdown("El mapa resalta en **Amarillo/Rojo** las zonas donde anduviste lento (< 1.5 km/h). Esas suelen ser las zonas de recolección.")
-        
-        col_list, col_map = st.columns([1, 4])
-        with col_list:
-            selected_id = st.selectbox("Centrar en ruta:", df['id'], format_func=lambda x: df[df['id']==x]['filename'].values[0])
-            route_data = df[df['id'] == selected_id].iloc[0]
-            
-            if st.button("🗑️ Borrar Ruta"):
-                db.delete_route(selected_id)
-                st.rerun()
+# --- LAYOUT DASHBOARD ---
 
-        with col_map:
-            center_pt = route_data['points'][len(route_data['points'])//2]
-            m = folium.Map(location=[center_pt['lat'], center_pt['lon']], zoom_start=14)
-            folium.TileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', attr='Esri').add_to(m)
+# Fila 1: El Mapa y los Controles de Análisis
+col_map, col_kpi = st.columns([3, 1])
 
-            # Dibujar ruta principal
-            pts = [(p['lat'], p['lon']) for p in route_data['points']]
-            folium.PolyLine(pts, color="#3498db", weight=3, opacity=0.6).add_to(m)
-            
-            # Dibujar "HOTSPOTS" (Velocidad baja = Recolección)
-            slow_points = [p for p in route_data['points'] if p.get('speed', 10) < 1.5 and p.get('speed', 10) > 0.1]
-            if slow_points:
-                heat_data = [[p['lat'], p['lon']] for p in slow_points]
-                # Heatmap específico de "zonas lentas"
-                HeatMap(heat_data, radius=10, gradient={0.4: 'yellow', 1: 'red'}, name="Zonas de Recolección").add_to(m)
+with col_kpi:
+    st.subheader("🔭 Análisis Local")
+    st.info("Mueve el mapa a la zona que quieras investigar (ej: Soria, Pirineos) y pulsa el botón.")
+    
+    # Estado de la sesión para guardar los límites del mapa
+    if 'map_bounds' not in st.session_state:
+        st.session_state.map_bounds = None
+    if 'map_center' not in st.session_state:
+        st.session_state.map_center = [40.416, -3.703] # Madrid default
 
-            st_folium(m, height=500, width="100%")
+    analyze_btn = st.button("📍 ANALIZAR ZONA VISIBLE", type="primary", use_container_width=True)
+    
+    # Filtros visuales (no afectan a los datos, solo al mapa)
+    heatmap_intensity = st.slider("Intensidad Heatmap", 0.1, 1.0, 0.6)
+    
+    # KPIs Globales (De todo el histórico)
+    st.divider()
+    st.metric("Total Puntos Trackeados", f"{len(df_all):,}")
+    st.metric("Años de registros", f"{df_all['year'].min()} - {df_all['year'].max()}")
 
-    # --- TAB 2: HIDROLOGÍA AVANZADA ---
-    with tab2:
-        st.subheader("Análisis de Humedad Real del Suelo (SMI)")
-        st.info("Este gráfico no muestra solo lluvia, muestra **cuánta agua retiene el suelo**. Si la curva azul sube, el micelio se activa.")
-        
-        # Usamos coordenadas de la ruta seleccionada
-        if st.button("Analizar Hidrología (Últimos 60 días)"):
-            with st.spinner("Calculando retención de agua y temperaturas..."):
-                meteo_df = get_advanced_weather(center_pt['lat'], center_pt['lon'])
-                
-                if meteo_df is not None:
-                    # Crear gráfico de doble eje
-                    fig = go.Figure()
+with col_map:
+    # Lógica del mapa
+    m = folium.Map(location=st.session_state.map_center, zoom_start=6, tiles=None)
+    folium.TileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', attr='Esri', name="Satélite").add_to(m)
+    folium.TileLayer('OpenStreetMap', name="Callejero").add_to(m)
+    
+    # Capa 1: HEATMAP GLOBAL (Lo que pedías: ver todo junto)
+    # Convertimos lat/lon a lista para el plugin
+    heat_data = df_all[['lat', 'lon']].values.tolist()
+    HeatMap(heat_data, radius=12, blur=15, min_opacity=heatmap_intensity, 
+            gradient={0.4: 'blue', 0.65: 'lime', 1: 'red'}).add_to(m)
 
-                    # 1. Barras de Lluvia (Eje Y derecho, invertido para que parezca que cae del cielo)
-                    fig.add_trace(go.Bar(
-                        x=meteo_df['time'], 
-                        y=meteo_df['precipitation_sum'], 
-                        name="Lluvia Diaria (mm)",
-                        marker_color='lightblue',
-                        opacity=0.4,
-                        yaxis='y2'
-                    ))
+    # Control de capas
+    folium.LayerControl().add_to(m)
+    
+    # Capturamos interacción
+    map_data = st_folium(m, height=500, width="100%", key="main_map")
 
-                    # 2. Curva SMI (Humedad Acumulada) - LA CLAVE
-                    fig.add_trace(go.Scatter(
-                        x=meteo_df['time'], 
-                        y=meteo_df['SMI'], 
-                        name="Humedad en Suelo (SMI)",
-                        line=dict(color='blue', width=4),
-                        fill='tozeroy',
-                        fillcolor='rgba(0, 0, 255, 0.1)'
-                    ))
+# --- LÓGICA DE FILTRADO GEOGRÁFICO ---
+filtered_df = df_all # Por defecto todo
+climate_df = None
+location_msg = "Mostrando datos globales"
 
-                    # 3. Temperatura del suelo
-                    fig.add_trace(go.Scatter(
-                        x=meteo_df['time'], 
-                        y=meteo_df['soil_temperature_0_to_7cm_mean'], 
-                        name="Temp. Suelo",
-                        line=dict(color='orange', width=2, dash='dot')
-                    ))
-
-                    # Configurar ejes
-                    fig.update_layout(
-                        title="Evolución del Biotopo: Lluvia vs Retención",
-                        yaxis=dict(title="Índice SMI / Temp (°C)"),
-                        yaxis2=dict(title="Lluvia (mm)", overlaying='y', side='right', range=[0, 100]),
-                        hovermode="x unified"
-                    )
-                    
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Interpretación automática
-                    last_smi = meteo_df['SMI'].iloc[-1]
-                    smi_trend = meteo_df['SMI'].iloc[-1] - meteo_df['SMI'].iloc[-5] # Tendencia 5 días
-                    
-                    c1, c2 = st.columns(2)
-                    c1.metric("Índice Humedad Actual", f"{last_smi:.1f}", delta=f"{smi_trend:.1f} ult. 5 días")
-                    
-                    interpretation = ""
-                    if last_smi < 10: interpretation = "🌵 Suelo SECO. Probabilidad baja salvo zonas de ribera."
-                    elif 10 <= last_smi < 30: interpretation = "⚠️ Recuperando humedad. Faltan unos días."
-                    elif 30 <= last_smi < 60: interpretation = "🍄 Condiciones IDEALES de humedad."
-                    else: interpretation = "💧 Suelo saturado/encharcado."
-                    
-                    c2.info(interpretation)
-
-    # --- TAB 3: TOPOGRAFÍA Y BOSQUE ---
-    with tab3:
-        st.subheader("Caracterización del Terreno")
-        
-        c1, c2 = st.columns(2)
-        
-        with c1:
-            # Gráfico de sectores: Solana vs Umbría
-            # Agrupar datos de todas las rutas o la seleccionada
-            fig_sun = px.pie(values=[route_data['pct_umbria'], route_data['pct_solana']], 
-                             names=["Umbría (Norte/Este)", "Solana (Sur/Oeste)"],
-                             title="Exposición Solar de la Ruta",
-                             color_discrete_sequence=['#2ecc71', '#f1c40f'])
-            st.plotly_chart(fig_sun, use_container_width=True)
-            
-        with c2:
-            st.metric("Tipo de Bosque", route_data['forest_type'])
-            st.metric("Desnivel", f"{route_data['elevation_gain']} m")
-            
-            # Histograma de Altitud (Donde has estado más tiempo)
-            elevations = [p['ele'] for p in route_data['points'] if p['ele']]
-            if elevations:
-                fig_ele = px.histogram(x=elevations, nbins=20, 
-                                       title="Distribución de Altitud (Cotas frecuentadas)",
-                                       labels={'x':'Altitud (m)'}, color_discrete_sequence=['#8e44ad'])
-                st.plotly_chart(fig_ele, use_container_width=True)
-
+if analyze_btn and map_data and map_data['bounds']:
+    # 1. Obtener límites de la pantalla
+    bounds = map_data['bounds']
+    sw = bounds['_southWest']
+    ne = bounds['_northEast']
+    center = map_data['center']
+    
+    st.session_state.map_center = [center['lat'], center['lng']] # Guardar centro para no resetear mapa
+    
+    # 2. Filtrar DataFrame "Big Data" por coordenadas
+    mask = (
+        (df_all['lat'] >= sw['lat']) & (df_all['lat'] <= ne['lat']) &
+        (df_all['lon'] >= sw['lng']) & (df_all['lon'] <= ne['lng'])
+    )
+    filtered_df = df_all.loc[mask]
+    
+    # 3. Obtener Clima del CENTRO del mapa
+    with st.spinner(f"Analizando clima en {center['lat']:.2f}, {center['lng']:.2f}..."):
+        climate_df = get_climate_data(center['lat'], center['lng'])
+    
+    location_msg = f"📍 Análisis de zona visible ({len(filtered_df)} puntos encontrados)"
 else:
-    st.info("Sube un GPX y selecciona el tipo de bosque para empezar.")
+    # Si no se ha filtrado, coger clima de un punto promedio global
+    pass 
+
+# --- PANELES DE RESULTADOS (ABAJO DEL MAPA) ---
+
+st.subheader(location_msg)
+
+if filtered_df.empty:
+    st.warning("No hay rutas en la zona del mapa que estás viendo. Haz zoom out o muévete a una zona con tracks.")
+else:
+    # Creamos 3 columnas de análisis Pro
+    c_climate, c_topo, c_pattern = st.columns([1.5, 1, 1])
+
+    # PANEL 1: CLIMATOLOGÍA EN TIEMPO REAL (DE LA ZONA)
+    with c_climate:
+        st.markdown("#### 🌦️ Clima (Últimos 45 días)")
+        if climate_df is not None:
+            climate_df['time'] = pd.to_datetime(climate_df['time'])
+            
+            # Cálculo SMI simple (Soil Moisture Index)
+            smi = []
+            curr = 0
+            for rain in climate_df['precipitation_sum']:
+                curr = (curr * 0.9) + rain
+                smi.append(curr)
+            climate_df['SMI'] = smi
+            
+            # Gráfico combinado
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=climate_df['time'], y=climate_df['precipitation_sum'], name="Lluvia (mm)", marker_color="skyblue"))
+            fig.add_trace(go.Scatter(x=climate_df['time'], y=climate_df['SMI'], name="Humedad Suelo", line=dict(color="blue", width=3), yaxis="y2"))
+            fig.add_trace(go.Scatter(x=climate_df['time'], y=climate_df['soil_temperature_0_to_7cm_mean'], name="Temp Suelo", line=dict(color="orange", dash="dot"), yaxis="y3"))
+            
+            fig.update_layout(
+                height=300, margin=dict(l=0, r=0, t=30, b=0),
+                yaxis=dict(title="Lluvia", domain=[0, 0.6]),
+                yaxis2=dict(title="Humedad", overlaying="y", side="right"),
+                yaxis3=dict(title="Temp", overlaying="y", side="left", position=0.05, domain=[0.65, 1]),
+                legend=dict(orientation="h", y=1.1)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Semáforo rápido
+            last_rain_15 = climate_df['precipitation_sum'].tail(15).sum()
+            last_smi = smi[-1]
+            st.caption(f"Lluvia acumulada (15d): **{last_rain_15:.1f}mm** | Índice Humedad: **{last_smi:.1f}**")
+        else:
+            st.info("Pulsa 'Analizar Zona Visible' para cargar el clima de esta región.")
+
+    # PANEL 2: TOPOGRAFÍA DE LA ZONA VISIBLE
+    with c_topo:
+        st.markdown("#### ⛰️ Cota y Topografía")
+        # Histograma de Altitud de los puntos VISIBLES
+        fig_ele = px.histogram(filtered_df, x="ele", nbins=20, 
+                               title="Distribución de Altitud (m)",
+                               color_discrete_sequence=['#8e44ad'])
+        fig_ele.update_layout(height=200, margin=dict(l=0, r=0, t=30, b=0), showlegend=False)
+        st.plotly_chart(fig_ele, use_container_width=True)
+        
+        # Estadística simple
+        mean_ele = filtered_df['ele'].mean()
+        st.metric("Cota Media en esta zona", f"{mean_ele:.0f} m")
+
+    # PANEL 3: PATRONES TEMPORALES (¿CUÁNDO VAS AQUÍ?)
+    with c_pattern:
+        st.markdown("#### 📅 ¿Cuándo funciona esta zona?")
+        # Extraer meses de los puntos filtrados
+        month_counts = filtered_df['month'].value_counts().sort_index()
+        
+        # Mapear números a nombres
+        month_names = {1:'Ene', 2:'Feb', 3:'Mar', 4:'Abr', 5:'May', 6:'Jun', 7:'Jul', 8:'Ago', 9:'Sep', 10:'Oct', 11:'Nov', 12:'Dic'}
+        df_months = pd.DataFrame({
+            'Mes': [month_names.get(x, x) for x in month_counts.index],
+            'Actividad': month_counts.values
+        })
+        
+        fig_time = px.bar(df_months, x='Mes', y='Actividad', 
+                          title="Tus visitas históricas",
+                          color='Actividad', color_continuous_scale='Viridis')
+        fig_time.update_layout(height=200, margin=dict(l=0, r=0, t=30, b=0))
+        st.plotly_chart(fig_time, use_container_width=True)
+        
+        # Predicción simple
+        best_month = df_months.loc[df_months['Actividad'].idxmax()]['Mes']
+        st.info(f"Históricamente, esta zona es de: **{best_month}**")
