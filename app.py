@@ -451,7 +451,8 @@ class DatabaseEngine:
         df = pd.read_sql_query(query, self.conn, params=params)
         
         if not df.empty:
-            df['date_start'] = pd.to_datetime(df['date_start'])
+            # Convertir fechas de forma segura, manejando errores
+            df['date_start'] = pd.to_datetime(df['date_start'], errors='coerce')
             
         return df
 
@@ -1049,18 +1050,23 @@ def render_sidebar():
         max_date_q = pd.read_sql("SELECT max(date_start) FROM routes", db.conn).iloc[0,0]
         
         if min_date_q and max_date_q:
-            min_d = datetime.strptime(min_date_q, "%Y-%m-%d %H:%M:%S").date()
-            max_d = datetime.strptime(max_date_q, "%Y-%m-%d %H:%M:%S").date()
-            
-            date_range = st.sidebar.date_input(
-                "Periodo de Análisis",
-                value=(min_d, max_d),
-                min_value=min_d,
-                max_value=max_d
-            )
+            # Intentar parsear fechas de forma segura
+            try:
+                min_d = pd.to_datetime(min_date_q).date()
+                max_d = pd.to_datetime(max_date_q).date()
+                
+                date_range = st.sidebar.date_input(
+                    "Periodo de Análisis",
+                    value=(min_d, max_d),
+                    min_value=min_d,
+                    max_value=max_d
+                )
+            except:
+                date_range = None
+                st.sidebar.caption("Error en formato de fechas de la BD.")
         else:
             date_range = None
-    except:
+    except Exception as e:
         date_range = None
         st.sidebar.caption("Sube rutas para habilitar filtro de fechas.")
 
@@ -1153,9 +1159,15 @@ with tab_map:
                     
                     color = "#ff9800" if "níscalo" in str(row.get('tags', '')).lower() else "#2e7d32"
                     
+                    # Formatear fecha de forma segura
+                    try:
+                        date_str = pd.to_datetime(row['date_start']).strftime('%Y-%m-%d') if pd.notna(row['date_start']) else 'Sin fecha'
+                    except:
+                        date_str = 'Sin fecha'
+                    
                     folium.PolyLine(
                         coords, color=color, weight=2.5, opacity=0.6,
-                        tooltip=f"{row['filename']} ({row['date_start'].strftime('%Y-%m-%d') if pd.notna(row['date_start']) else 'N/A'})"
+                        tooltip=f"{row['filename']} ({date_str})"
                     ).add_to(m)
                 except Exception as e:
                     logger.warning(f"Error dibujando ruta {row['id']}: {e}")
@@ -1374,25 +1386,40 @@ with tab_analysis:
             
         with col_charts_2:
             st.subheader("📅 Patrones Temporales")
-            df_metadata['month'] = pd.to_datetime(df_metadata['date_start']).dt.month_name()
-            month_order = ['January', 'February', 'March', 'April', 'May', 'June', 
-                           'July', 'August', 'September', 'October', 'November', 'December']
             
-            month_counts = df_metadata['month'].value_counts().reindex(month_order).dropna()
+            # Convertir fechas de forma segura
+            df_metadata['date_start_parsed'] = pd.to_datetime(df_metadata['date_start'], errors='coerce')
             
-            fig_time = px.bar(
-                x=month_counts.index,
-                y=month_counts.values,
-                title="Salidas por Mes",
-                color_discrete_sequence=['#66bb6a'],
-                labels={'x': 'Mes', 'y': 'Número de Salidas'}
-            )
-            st.plotly_chart(fig_time, use_container_width=True)
+            # Solo procesar filas con fechas válidas
+            df_valid_dates = df_metadata[df_metadata['date_start_parsed'].notna()].copy()
+            
+            if not df_valid_dates.empty:
+                df_valid_dates['month'] = df_valid_dates['date_start_parsed'].dt.month_name()
+                month_order = ['January', 'February', 'March', 'April', 'May', 'June', 
+                               'July', 'August', 'September', 'October', 'November', 'December']
+                
+                month_counts = df_valid_dates['month'].value_counts().reindex(month_order).dropna()
+                
+                fig_time = px.bar(
+                    x=month_counts.index,
+                    y=month_counts.values,
+                    title="Salidas por Mes",
+                    color_discrete_sequence=['#66bb6a'],
+                    labels={'x': 'Mes', 'y': 'Número de Salidas'}
+                )
+                st.plotly_chart(fig_time, use_container_width=True)
+            else:
+                st.warning("No hay fechas válidas para mostrar patrones temporales.")
         
         # Tabla de rutas
         st.subheader("📋 Detalle de Rutas")
         display_df = df_metadata[['filename', 'date_start', 'tags', 'total_distance_km', 'elevation_gain_m', 'avg_speed_kmh']].copy()
+        
+        # Formatear fecha de forma segura
+        display_df['date_start'] = pd.to_datetime(display_df['date_start'], errors='coerce')
         display_df['date_start'] = display_df['date_start'].dt.strftime('%Y-%m-%d')
+        display_df['date_start'] = display_df['date_start'].fillna('Sin fecha')
+        
         display_df.columns = ['Archivo', 'Fecha', 'Etiquetas', 'Distancia (km)', 'Desnivel (m)', 'Velocidad Media (km/h)']
         st.dataframe(display_df, use_container_width=True, hide_index=True)
 
