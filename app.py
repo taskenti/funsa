@@ -1212,8 +1212,8 @@ with tab_map:
             height=600, 
             width="100%",
             key="main_map_widget",
-            update_zoom=True,
-            update_bounds=True
+            # Eliminamos update_zoom y update_bounds que causaban el error
+            returned_objects=["last_clicked", "bounds", "zoom", "center"] 
         )
         
         # ACTUALIZACIÓN DE ESTADO (BOUNDS Y CENTRO)
