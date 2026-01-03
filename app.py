@@ -206,7 +206,7 @@ class GeoMath:
         return np.degrees(slope_rad)
 
     @staticmethod
-    def get_solar_aspect(bearing):
+    def get_aspect_category(bearing):
         """
         Clasifica la orientación de una ladera para determinar Solana vs Umbría.
         Fundamental para micología (humedad vs calor).
