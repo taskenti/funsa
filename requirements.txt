@@ -5,7 +5,7 @@ folium
 streamlit-folium
 plotly
 requests
-supabase
 scipy
 numpy
 scikit-learn
+branca
